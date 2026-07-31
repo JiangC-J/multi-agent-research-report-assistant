@@ -1,111 +1,218 @@
 # 企业多 Agent 研究报告助手
 
-一个面向企业研究场景的 AI 应用：用户提交研究主题后，系统通过多 Agent 协作完成任务规划、网页检索、证据提取、结论分析、证据审核和报告生成，并输出可追溯来源的研究报告。
+一个面向企业研究场景的全栈 AI 应用。
 
-## 1. 业务问题
+用户提交研究主题后，系统将长任务投递到后台队列，由 Planner、Researcher、Analyst、Reviewer、Writer 五个 Agent 协作完成任务规划、资料检索、证据提取、结论分析、证据审核和最终报告生成。
+
+最终输出结构化研究报告，并建立“报告章节 → Claim → Evidence → Source URL”的可追溯链路。
+
+## 项目解决的问题
 
 企业研究任务通常存在以下问题：
 
-- 人工检索资料耗时长，且来源质量不稳定；
-- LLM 直接生成报告容易出现无来源结论或幻觉；
-- 长耗时任务不适合由 HTTP 请求同步等待；
-- 任务失败后缺少可定位的执行轨迹和错误信息。
+- 人工检索资料耗时，且来源质量不稳定；
+- 大模型直接生成报告时，容易产生无来源结论或来源幻觉；
+- 研究任务耗时较长，不适合让 HTTP 请求同步等待；
+- 任务失败后难以定位具体 Agent、执行阶段和错误原因；
+- 后端即使生成报告，用户也缺少直观的执行进度与来源阅读体验；
+- AI 能力通常只能通过固定前端访问，难以被其他 AI Client 标准化接入。
 
-本项目通过多 Agent 工作流、Evidence 约束、异步队列和执行审计解决这些问题。
+本项目通过多 Agent 工作流、结构化 Schema、证据约束、Redis、Celery、React、Docker Compose 和 MCP Server 解决这些问题。
 
-## 2. 核心能力
+## 核心能力
 
 - LangGraph 编排 Planner、Researcher、Analyst、Reviewer、Writer 多 Agent 工作流；
-- Planner 将研究主题拆分为多个可执行子任务；
-- Researcher 支持查询改写、多查询并发检索、URL 去重和 RRF 融合；
-- Evidence Extraction 只允许选择真实检索到的 URL；
-- 服务端从真实检索内容生成证据原文摘录，避免模型伪造来源；
+- Planner 将研究主题拆解为可执行子任务；
+- Researcher 支持查询改写、多查询检索、RRF 融合、URL 去重与证据提取；
+- Evidence Extraction 只能从真实检索结果中选择来源 URL，避免模型编造来源；
 - Analyst 基于 Evidence 生成结构化 Claim；
-- Reviewer 对 Claim 与 Evidence 的一致性进行审核；
+- Reviewer 校验 Claim 与 Evidence 的一致性；
 - Writer 仅使用审核通过的 Claim 生成最终报告；
-- Redis 缓存 Tavily 检索结果，降低重复检索成本；
+- Report Section → Claim → Evidence → Source URL 形成可追溯链路；
+- Redis 缓存 Tavily 搜索结果，并在 Redis 故障时 fail-open 降级；
 - Celery + Redis 将长任务从同步 HTTP 请求迁移到后台 Worker；
-- WorkflowRun、AgentRun、任务状态机提供执行审计；
-- Docker Compose 一键启动 API、Worker、Redis 和 Flower；
-- Pytest + GitHub Actions CI 提供回归测试保护。
+- WorkflowRun、AgentRun、任务状态机记录执行轨迹、耗时、Token、成本和错误；
+- React 前端展示任务创建、Agent 执行状态、最终报告和可点击来源；
+- Nginx 提供 Docker 化前端，并将 `/api/*` 反向代理到 FastAPI；
+- MCP Server 将任务、报告和审计能力标准化开放给 AI Client；
+- Pytest 与 GitHub Actions CI 提供回归测试保护。
 
-## 3. 系统架构
+## 系统架构
 
 ```mermaid
 flowchart LR
-    User[用户 / Swagger / 前端]
-    API[FastAPI API]
-    DB[(SQLite)]
-    Redis[(Redis)]
-    Worker[Celery Worker]
-    Flower[Flower]
-    Tavily[Tavily Search]
-    LLM[LLM API]
+    User["用户浏览器"]
+    AIClient["支持 MCP 的 AI Client"]
+    Frontend["React + Nginx<br/>localhost:8080"]
+    API["FastAPI"]
+    MCP["FastMCP Server"]
+    DB[("SQLite")]
+    Redis[("Redis")]
+    Worker["Celery Worker"]
+    Flower["Flower"]
+    Tavily["Tavily Search"]
+    LLM["LLM API"]
 
-    User --> API
+    User --> Frontend
+    Frontend -->|"/api/*"| API
+    AIClient --> MCP
+
     API --> DB
     API --> Redis
+    MCP --> DB
+
     Redis --> Worker
     Worker --> DB
     Worker --> Tavily
     Worker --> LLM
     Worker --> Redis
+
     Flower --> Redis
 ```
 
-## 4. 多 Agent 工作流
+## 多 Agent 工作流
 
-```mermaid
-flowchart LR
-    Start([开始])
-    Planner[Planner<br/>拆分研究子任务]
-    Researcher[Researcher<br/>改写查询、检索、提取证据]
-    Analyst[Analyst<br/>生成结构化 Claim]
-    Reviewer[Reviewer<br/>审核证据一致性]
-    Decision{审核是否通过？}
-    Writer[Writer<br/>生成最终报告]
-    End([结束])
-
-    Start --> Planner
-    Planner --> Researcher
-    Researcher --> Analyst
-    Analyst --> Reviewer
-    Reviewer --> Decision
-    Decision -- 通过 --> Writer
-    Writer --> End
-    Decision -- 需补充研究 --> End
+```text
+PENDING
+  ↓
+QUEUED
+  ↓
+PLANNING      → Planner：拆解研究目标与子任务
+  ↓
+RESEARCHING   → Researcher：检索、查询改写、证据提取
+  ↓
+ANALYZING     → Analyst：将证据转化为结构化 Claim
+  ↓
+REVIEWING     → Reviewer：核验 Claim 与 Evidence 的一致性
+  ↓
+WRITING       → Writer：仅使用审核通过的 Claim 生成报告
+  ↓
+COMPLETED
 ```
 
-## 5. 技术栈
+任何阶段发生异常，任务会进入 `FAILED`，并持久化错误信息与执行记录。
+
+## 证据可追溯设计
+
+项目不直接相信模型生成的来源链接，而是建立以下约束：
+
+```text
+Tavily 检索结果
+  ↓
+Evidence Extraction 仅选择真实检索结果中的 URL
+  ↓
+服务端从实际检索文本中生成 evidence excerpt
+  ↓
+Analyst 只能基于 Evidence 创建 Claim
+  ↓
+Reviewer 审核 Claim 与 Evidence
+  ↓
+Writer 只能使用 APPROVED Claim
+  ↓
+Report Citation 绑定 Evidence ID
+  ↓
+前端 / MCP 返回真实来源标题与 URL
+```
+
+该设计降低了“模型编造引用来源”的风险，并支持对最终结论进行来源追溯。
+
+## MCP Server
+
+项目提供一个基于 FastMCP 的本地 MCP Server：
+
+```text
+app/mcp_server.py
+```
+
+MCP 层不直接操作 ORM，而是复用现有 Service 和 Repository 分层，因此 FastAPI、Celery Worker、React 前端和 MCP Client 共享同一套业务规则与 SQLite 数据。
+
+### MCP Tools
+
+| Tool | 用途 |
+|---|---|
+| `get_research_task` | 查询任务状态、主题、要求与失败信息 |
+| `get_final_report` | 查询最终报告、Markdown 内容和引用来源 |
+| `get_execution_trace` | 查询 WorkflowRun、AgentRun、耗时、Token、成本与错误 |
+
+### MCP Resource
+
+```text
+research://tasks/{task_id}/summary
+```
+
+该 Resource Template 为外部 AI Client 提供可通过 URI 读取的只读任务摘要。
+
+示例：
+
+```text
+research://tasks/2a73a041-3048-4301-9c78-73d920ed424d/summary
+```
+
+### MCP Prompt
+
+```text
+review_research_report
+```
+
+该 Prompt 为客户端 LLM 提供标准化的报告审阅指令，要求：
+
+- 查询任务状态；
+- 读取最终报告与来源；
+- 读取多 Agent 执行审计轨迹；
+- 面向企业管理者输出结论、风险、建议和局限性；
+- 不得编造来源；
+- 明确低质量证据或资料不足导致的不确定性。
+
+### 启动 MCP Inspector
+
+在项目根目录执行：
+
+```powershell
+npx --yes @modelcontextprotocol/inspector .\.venv\Scripts\python.exe -m app.mcp_server
+```
+
+浏览器打开 Inspector 后，可验证：
+
+- `Tools`：查看和调用三个查询 Tool；
+- `Resources`：读取任务摘要 Resource；
+- `Prompts`：获取报告审阅 Prompt。
+
+## 技术栈
 
 | 分类 | 技术 |
 |---|---|
-| Web API | FastAPI、Pydantic |
-| 多 Agent 编排 | LangGraph、LangChain |
-| 大模型 | OpenAI 兼容接口 |
+| 后端 API | FastAPI、Pydantic |
+| AI 编排 | LangGraph、LangChain |
+| 模型调用 | OpenAI 兼容 API |
 | 网页检索 | Tavily |
-| 关系数据 | SQLite、SQLAlchemy |
+| 数据库 | SQLite、SQLAlchemy |
 | 缓存与消息队列 | Redis |
-| 异步任务 | Celery |
-| 任务监控 | Flower |
+| 长任务异步化 | Celery |
+| 工作流监控 | Flower |
+| MCP | FastMCP、MCP Inspector |
+| 前端 | React、Vite |
+| 前端 Web Server | Nginx |
 | 容器化 | Docker、Docker Compose |
 | 测试 | Pytest |
 | CI | GitHub Actions |
 
-## 6. 数据与职责边界
+## 本地运行
 
-| 数据 | 保存位置 | 说明 |
-|---|---|---|
-| 研究任务、子任务、Evidence、Claim、Report | SQLite | 长期业务事实与审计数据 |
-| AgentRun | SQLite | 单个 Agent 的执行、Token 和耗时记录 |
-| WorkflowRun | SQLite | 完整后台工作流的排队、执行和失败记录 |
-| Tavily 搜索缓存 | Redis DB 0 | 可丢失、可重建的短期缓存 |
-| Celery Broker | Redis DB 1 | 等待 Worker 消费的任务消息 |
-| Celery Result Backend | Redis DB 2 | Celery 实时技术状态和返回值 |
+### 1. 创建并激活虚拟环境
 
-## 7. 本地启动
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
 
-### 7.1 配置环境变量
+### 2. 安装依赖
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+### 3. 配置环境变量
 
 复制示例文件：
 
@@ -113,177 +220,141 @@ flowchart LR
 Copy-Item .env.example .env
 ```
 
-在 `.env` 中填写：
+然后在 `.env` 中填写：
 
 ```text
-LLM_API_KEY=你的模型API_KEY
+LLM_API_KEY=你的模型服务密钥
 LLM_MODEL=你的模型名称
-LLM_BASE_URL=模型服务商地址
-TAVILY_API_KEY=你的Tavily_API_KEY
+LLM_BASE_URL=你的模型服务地址
+TAVILY_API_KEY=你的 Tavily 密钥
 ```
 
-`.env` 已被 `.gitignore` 忽略，不应提交到 GitHub。
-
-### 7.2 使用 Docker Compose 启动
+### 4. 启动 Redis
 
 ```powershell
-docker compose up --build -d
+docker compose up -d redis
 ```
 
-查看服务状态：
+### 5. 启动 FastAPI
 
 ```powershell
-docker compose ps
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
-查看 API 日志：
+API 文档地址：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+### 6. 启动 Celery Worker
+
+新开一个终端：
 
 ```powershell
-docker compose logs -f api
+.\.venv\Scripts\python.exe -m celery -A app.core.celery_app:celery_app worker --loglevel=INFO --pool=solo
 ```
 
-查看 Celery Worker 日志：
+### 7. 启动前端开发服务
+
+新开一个终端：
 
 ```powershell
-docker compose logs -f worker
+cd frontend
+npm install
+npm run dev
 ```
 
-### 7.3 访问地址
+前端开发地址：
+
+```text
+http://localhost:5173
+```
+
+## Docker Compose 运行
+
+确保 `.env` 已填写真实密钥后，在项目根目录执行：
+
+```powershell
+docker compose up --build
+```
+
+服务地址：
 
 | 服务 | 地址 |
 |---|---|
-| Swagger API 文档 | http://127.0.0.1:8000/docs |
-| 健康检查 | http://127.0.0.1:8000/health |
-| Flower 监控面板 | http://127.0.0.1:5555 |
+| React 前端 | `http://localhost:8080` |
+| FastAPI 文档 | `http://localhost:8000/docs` |
+| Flower 监控 | `http://localhost:5555` |
+| 健康检查 | `http://localhost:8080/api/health` |
 
-## 8. 典型使用流程
-
-1. 调用 `POST /research-tasks` 创建研究任务；
-2. 调用 `POST /research-tasks/{task_id}/run`；
-3. API 立即返回 `202 Accepted`、`celery_task_id` 和 `workflow_run_id`；
-4. 调用 `GET /research-tasks/{task_id}` 查询业务状态；
-5. 调用 `GET /research-tasks/{task_id}/workflow-runs` 查询后台执行历史；
-6. 调用 `GET /background-tasks/{celery_task_id}` 查询 Celery 技术状态；
-7. 任务完成后调用 `GET /research-tasks/{task_id}/report` 获取研究报告。
-
-## 9. 状态设计
-
-### 研究任务业务状态
-
-```text
-PENDING
-→ QUEUED
-→ PLANNING
-→ RESEARCHING
-→ ANALYZING
-→ REVIEWING
-→ WRITING
-→ COMPLETED
-```
-
-任何非终态都可以在异常时进入：
-
-```text
-FAILED
-```
-
-### 工作流执行状态
-
-```text
-QUEUED
-→ RUNNING
-→ SUCCEEDED
-
-QUEUED / RUNNING
-→ FAILED
-```
-
-`ResearchTask.status` 描述研究业务进行到哪个阶段；`WorkflowRun.status` 描述一次 Celery 执行尝试的生命周期；两者不能混用。
-
-## 10. 测试
-
-本地运行：
+停止服务：
 
 ```powershell
-python -m pytest -q
+docker compose down
 ```
 
-容器内运行：
+## 测试
+
+运行所有测试：
 
 ```powershell
-docker compose exec api python -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-当前测试覆盖：
+测试覆盖：
 
-- Query Rewrite Schema 归一化；
-- Evidence 类型别名与 URL 去重；
-- Reviewer 审核一致性保护；
-- Analyst 输出数量限制；
-- Redis 缓存命中与 Redis 故障降级；
-- LangGraph 主流程与审核分支；
-- WorkflowRun 状态机与执行耗时。
+- 任务状态机；
+- 结构化 Schema Guardrails；
+- Redis 缓存与 fail-open；
+- WorkflowRun 状态与耗时；
+- MCP 输入校验；
+- MCP Prompt 约束；
+- MCP 查询函数的结构化失败结果。
 
-GitHub Actions 会在每次 Push 或 Pull Request 时自动运行语法检查与测试。
-
-## 11. 关键工程设计
-
-### 11.1 防止来源幻觉
-
-模型不能自行编造证据 URL。
-
-Evidence Extraction Agent 只能从 Tavily 返回的候选 URL 中选择；服务端从真实检索文本生成 `content_excerpt`，建立：
+## 项目目录
 
 ```text
-Report Section
-→ Claim
-→ Evidence
-→ Source URL
+14.MultiAgent_Research_Agent/
+├── app/
+│   ├── agents/                 # 多 Agent 定义
+│   ├── api/                    # FastAPI 路由
+│   ├── clients/                # LLM、Redis、Tavily 客户端
+│   ├── core/                   # 配置、数据库、Celery
+│   ├── graphs/                 # LangGraph 工作流
+│   ├── models/                 # SQLAlchemy 模型
+│   ├── repositories/           # 数据访问层
+│   ├── schemas/                # Pydantic Schema
+│   ├── services/               # 业务服务层
+│   ├── tasks/                  # Celery 后台任务
+│   └── mcp_server.py           # MCP Server 入口
+├── frontend/                   # React + Vite + Nginx 前端
+├── tests/                      # Pytest 测试
+├── docs/                       # 设计与学习文档
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
 ```
 
-的可追溯链路。
+## 面试亮点
 
-### 11.2 长任务异步化
+1. 多 Agent 职责边界清晰：规划、检索、分析、审核、成文分离；
+2. 通过结构化 Schema 和 Evidence 约束降低来源幻觉；
+3. 使用 Celery + Redis 处理长任务，避免同步 HTTP 超时；
+4. 通过 WorkflowRun、AgentRun 记录执行轨迹、耗时、Token、成本和失败原因；
+5. React 前端展示多 Agent 实时阶段和最终可追溯报告；
+6. 使用 Docker Compose 一键启动前端、API、Worker、Redis 和 Flower；
+7. 使用 MCP Tool、Resource、Prompt 将应用能力标准化开放给外部 AI Client；
+8. MCP 层复用 Service / Repository，避免协议接入导致业务规则分叉；
+9. 使用 Pytest 和 GitHub Actions 防止回归。
 
-研究任务可能持续数分钟，因此 API 不同步等待工作流结束。
+## 后续可演进方向
 
-```text
-FastAPI 接收任务
-→ 返回 202 Accepted
-→ Redis Broker
-→ Celery Worker 执行 LangGraph
-→ SQLite 持久化状态与报告
-```
-
-### 11.3 Redis Fail-open 缓存
-
-Tavily 搜索结果采用 Cache Aside 模式：
-
-```text
-优先读取 Redis
-→ 未命中时调用 Tavily
-→ 成功后写入 Redis
-```
-
-Redis 不可用时，系统自动绕过缓存并调用 Tavily，避免缓存服务成为单点故障。
-
-## 12. 当前限制与后续计划
-
-当前项目采用 SQLite，适合单机开发和作品集演示。生产化后可继续演进：
-
-- 使用 PostgreSQL 替代 SQLite；
-- 使用 Alembic 管理数据库迁移；
-- 增加任务幂等锁与受控重试；
-- 引入 React 前端，实现任务轮询与报告展示；
-- 使用 SSE 推送实时 Agent 执行进度；
-- 接入 MCP Server，扩展企业知识库、文件系统或内部系统工具；
-- 增加 Docker 生产镜像与部署配置。
-
-## 13. 面试亮点
-
-- 多 Agent 职责边界清晰：规划、检索、分析、审核、写作解耦；
-- 用 Schema 和服务端校验约束模型输出，而不只依赖 Prompt；
-- 证据、结论、报告之间建立可追溯引用；
-- 使用 Redis、Celery 解决长任务与 HTTP 超时问题；
-- 使用 WorkflowRun 与 AgentRun 形成任务级和节点级审计；
-- 使用 Docker Compose、Flower、Pytest 和 GitHub Actions 体现工程化能力。
+- SQLite 迁移至 PostgreSQL，并使用 Alembic 管理数据库迁移；
+- Redis Queue、Celery 重试策略和死信队列；
+- Hybrid Search、向量检索与 Rerank；
+- MCP Streamable HTTP、认证授权与多租户隔离；
+- 任务进度 SSE 或 WebSocket 推送；
+- GitHub Actions 自动构建 Docker 镜像；
+- 云端部署与日志监控。
