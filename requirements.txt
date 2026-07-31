@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic-settings
+langchain-core
+langchain-openai
+langgraph
+tavily-python
+httpx
+redis>=5.0.0
+celery[redis]>=5.5.0
+flower>=2.0.0
