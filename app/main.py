@@ -1,13 +1,13 @@
 from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.agent_runs import router as agent_runs_router
+from app.api.analyst_execution import router as analyst_execution_router
 from app.api.background_tasks import (
     router as background_tasks_router,
 )
-from fastapi import FastAPI
-from app.api.workflow_runs import (
-    router as workflow_runs_router,
-)
-from app.api.agent_runs import router as agent_runs_router
-from app.api.analyst_execution import router as analyst_execution_router
 from app.api.claims import router as claims_router
 from app.api.evidences import router as evidences_router
 from app.api.planner_execution import router as planner_execution_router
@@ -17,13 +17,18 @@ from app.api.query_rewrite_execution import (
 from app.api.reports import router as reports_router
 from app.api.research_plans import router as research_plans_router
 from app.api.research_tasks import router as research_tasks_router
-from app.api.researcher_execution import router as researcher_execution_router
+from app.api.researcher_execution import (
+    router as researcher_execution_router,
+)
 from app.api.retrieval import router as retrieval_router
 from app.api.review_decision import router as review_decision_router
-from app.api.reviewer_execution import router as reviewer_execution_router
+from app.api.reviewer_execution import (
+    router as reviewer_execution_router,
+)
 from app.api.reviews import router as reviews_router
 from app.api.search import router as search_router
 from app.api.workflows import router as workflows_router
+from app.api.workflow_runs import router as workflow_runs_router
 from app.api.writer_execution import router as writer_execution_router
 from app.clients.redis_client import close_redis_client
 from app.core.database import init_db
@@ -51,6 +56,23 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+# 前端开发服务器白名单。
+# 只允许本机 React 页面访问 API，不允许任意外部网站跨域调用。
+FRONTEND_DEV_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_DEV_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 app.include_router(research_tasks_router)
 app.include_router(workflows_router)
